@@ -92,6 +92,13 @@ Please use with care!
 Document the BugID that your workaround is paired with."""
 
 workarounds_opts = [
+    cfg.BoolOpt('disable_libvirt_livesnapshot',
+                default=True,
+                help='When using libvirt 1.2.2 fails live snapshots '
+                     'intermittently under load.  This config option provides '
+                     'mechanism to disable livesnapshot while this is '
+                     'resolved.  See '
+                     'https://bugs.launchpad.net/nova/+bug/1334398'),
     ]
 CONF = cfg.CONF
 CONF.register_opts(monkey_patch_opts)

@@ -77,10 +77,34 @@ utils_opts = [
     cfg.StrOpt('tempdir',
                help='Explicitly specify the temporary working directory'),
 ]
+
+""" This group is for very specific reasons.
+
+If you're:
+- Working around an issue in a system tool (e.g. libvirt or qemu) where the fix
+  is in flight/discussed in that community.
+- The tool can be/is fixed in some distributions and rather than patch the code
+  those distributions can trivially set a config option to get the "correct"
+  behavior.
+This is a good place for your workaround.
+
+Please use with care!
+Document the BugID that your workaround is paired with."""
+
+workarounds_opts = [
+    cfg.BoolOpt('disable_libvirt_livesnapshot',
+                default=True,
+                help='When using libvirt 1.2.2 fails live snapshots '
+                     'intermittently under load.  This config option provides '
+                     'mechanism to disable livesnapshot while this is '
+                     'resolved.  See '
+                     'https://bugs.launchpad.net/nova/+bug/1334398'),
+    ]
 CONF = cfg.CONF
 CONF.register_opts(monkey_patch_opts)
 CONF.register_opts(utils_opts)
 CONF.import_opt('network_api_class', 'nova.network')
+CONF.register_opts(workarounds_opts, group='workarounds')
 
 LOG = logging.getLogger(__name__)
 

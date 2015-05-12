@@ -301,6 +301,11 @@ def reverts_task_state(function):
                     self._instance_update(context,
                                           instance_uuid,
                                           task_state=None)
+                except exception.InstanceNotFound:
+                    # We might delete an instance that failed to build shortly
+                    # after it errored out this is an expected case and we
+                    # should not trace on it.
+                    pass
                 except Exception as e:
                     msg = _LW("Failed to revert task state for instance. "
                               "Error: %s")
@@ -779,7 +784,7 @@ class ComputeManager(manager.Manager):
                                     network_info,
                                     bdi, destroy_disks)
 
-    def _is_instance_storage_shared(self, context, instance):
+    def _is_instance_storage_shared(self, context, instance, host=None):
         shared_storage = True
         data = None
         try:
@@ -788,7 +793,7 @@ class ComputeManager(manager.Manager):
             if data:
                 shared_storage = (self.compute_rpcapi.
                                   check_instance_shared_storage(context,
-                                  instance, data))
+                                  instance, data, host=host))
         except NotImplementedError:
             LOG.warning(_('Hypervisor driver does not support '
                           'instance shared storage check, '
@@ -3520,8 +3525,10 @@ class ComputeManager(manager.Manager):
             block_device_info = self._get_instance_block_device_info(
                                 context, instance, bdms=bdms)
 
+            destroy_disks = not self._is_instance_storage_shared(
+                context, instance, host=migration.source_compute)
             self.driver.destroy(context, instance, network_info,
-                                block_device_info)
+                                block_device_info, destroy_disks)
 
             self._terminate_volume_connections(context, instance, bdms)
 
@@ -4084,7 +4091,7 @@ class ComputeManager(manager.Manager):
 
         with self._error_out_instance_on_exception(context, instance,
              instance_state=instance['vm_state']):
-            self.driver.suspend(instance)
+            self.driver.suspend(context, instance)
         current_power_state = self._get_power_state(context, instance)
         instance.power_state = current_power_state
         instance.vm_state = vm_states.SUSPENDED
@@ -5366,6 +5373,11 @@ class ComputeManager(manager.Manager):
                 self._get_instance_nw_info(context, instance, use_slave=True)
                 LOG.debug('Updated the network info_cache for instance',
                           instance=instance)
+            except exception.InstanceNotFound:
+                # Instance is gone.
+                LOG.debug('Instance no longer exists. Unable to refresh',
+                          instance=instance)
+                return
             except Exception:
                 LOG.error(_('An error occurred while refreshing the network '
                             'cache.'), instance=instance, exc_info=True)
@@ -5829,7 +5841,16 @@ class ComputeManager(manager.Manager):
                      instance=db_instance)
             return
 
+        orig_db_power_state = db_power_state
         if vm_power_state != db_power_state:
+            LOG.info(_LI('During _sync_instance_power_state the DB '
+                         'power_state (%(db_power_state)s) does not match '
+                         'the vm_power_state from the hypervisor '
+                         '(%(vm_power_state)s). Updating power_state in the '
+                         'DB to match the hypervisor.'),
+                     {'db_power_state': db_power_state,
+                      'vm_power_state': vm_power_state},
+                     instance=db_instance)
             # power_state is always updated from hypervisor to db
             db_instance.power_state = vm_power_state
             db_instance.save()
@@ -5850,12 +5871,12 @@ class ComputeManager(manager.Manager):
                                   power_state.CRASHED):
                 LOG.warn(_LW("Instance shutdown by itself. Calling the stop "
                              "API. Current vm_state: %(vm_state)s, current "
-                             "task_state: %(task_state)s, current DB "
+                             "task_state: %(task_state)s, original DB "
                              "power_state: %(db_power_state)s, current VM "
                              "power_state: %(vm_power_state)s"),
                          {'vm_state': vm_state,
                           'task_state': db_instance.task_state,
-                          'db_power_state': db_power_state,
+                          'db_power_state': orig_db_power_state,
                           'vm_power_state': vm_power_state},
                          instance=db_instance)
                 try:
@@ -5906,11 +5927,11 @@ class ComputeManager(manager.Manager):
                 LOG.warn(_LW("Instance is not stopped. Calling "
                              "the stop API. Current vm_state: %(vm_state)s, "
                              "current task_state: %(task_state)s, "
-                             "current DB power_state: %(db_power_state)s, "
+                             "original DB power_state: %(db_power_state)s, "
                              "current VM power_state: %(vm_power_state)s"),
                          {'vm_state': vm_state,
                           'task_state': db_instance.task_state,
-                          'db_power_state': db_power_state,
+                          'db_power_state': orig_db_power_state,
                           'vm_power_state': vm_power_state},
                          instance=db_instance)
                 try:

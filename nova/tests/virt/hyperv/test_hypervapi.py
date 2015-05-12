@@ -415,7 +415,8 @@ class HyperVAPITestCase(HyperVAPIBaseTestCase):
     def _setup_spawn_config_drive_mocks(self, use_cdrom):
         instance_metadata.InstanceMetadata(mox.IgnoreArg(),
                                            content=mox.IsA(list),
-                                           extra_md=mox.IsA(dict))
+                                           extra_md=mox.IsA(dict),
+                                           network_info=mox.IsA(list))
 
         m = fake.PathUtils.get_instance_dir(mox.IsA(str))
         m.AndReturn(self._test_instance_dir)
@@ -586,11 +587,14 @@ class HyperVAPITestCase(HyperVAPIBaseTestCase):
                                    constants.HYPERV_VM_STATE_ENABLED)
 
     def test_suspend(self):
-        self._test_vm_state_change(self._conn.suspend, None,
+        self._test_vm_state_change(lambda i: self._conn.suspend(self._context,
+                                                                i),
+                                   None,
                                    constants.HYPERV_VM_STATE_SUSPENDED)
 
     def test_suspend_already_suspended(self):
-        self._test_vm_state_change(self._conn.suspend,
+        self._test_vm_state_change(lambda i: self._conn.suspend(self._context,
+                                                                i),
                                    constants.HYPERV_VM_STATE_SUSPENDED,
                                    constants.HYPERV_VM_STATE_SUSPENDED)
 
@@ -984,6 +988,7 @@ class HyperVAPITestCase(HyperVAPIBaseTestCase):
         vmutils.VMUtils.create_vm(mox.Func(self._check_vm_name), mox.IsA(int),
                                   mox.IsA(int), mox.IsA(bool),
                                   CONF.hyperv.dynamic_memory_ratio,
+                                  mox.IsA(str),
                                   mox.IsA(list))
 
         if not boot_from_volume:

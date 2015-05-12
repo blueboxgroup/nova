@@ -434,6 +434,15 @@ class LibvirtDriver(driver.ComputeDriver):
 
         self._volume_api = volume.API()
         self._image_api = image.API()
+        self._events_delayed = {}
+        # Note(toabctl): During a reboot of a Xen domain, STOPPED and
+        #                STARTED events are sent. To prevent shutting
+        #                down the domain during a reboot, delay the
+        #                STOPPED lifecycle event some seconds.
+        if CONF.libvirt.virt_type == "xen":
+            self._lifecycle_delay = 15
+        else:
+            self._lifecycle_delay = 0
 
         sysinfo_serial_funcs = {
             'none': lambda: None,
@@ -604,7 +613,8 @@ class LibvirtDriver(driver.ComputeDriver):
             try:
                 event = self._event_queue.get(block=False)
                 if isinstance(event, virtevent.LifecycleEvent):
-                    self.emit_event(event)
+                    # call possibly with delay
+                    self._event_emit_delayed(event)
                 elif 'conn' in event and 'reason' in event:
                     last_close_event = event
             except native_Queue.Empty:
@@ -623,6 +633,38 @@ class LibvirtDriver(driver.ComputeDriver):
                 # Disable compute service to avoid
                 # new instances of being scheduled on this host.
                 self._set_host_enabled(False, disable_reason=_error)
+
+    def _event_emit_delayed(self, event):
+        """Emit events - possibly delayed."""
+        def event_cleanup(gt, *args, **kwargs):
+            """Callback function for greenthread. Called
+            to cleanup the _events_delayed dictionary when a event
+            was called.
+            """
+            event = args[0]
+            self._events_delayed.pop(event.uuid, None)
+
+        if self._lifecycle_delay > 0:
+            # Cleanup possible delayed stop events.
+            if event.uuid in self._events_delayed.keys():
+                self._events_delayed[event.uuid].cancel()
+                self._events_delayed.pop(event.uuid, None)
+                LOG.debug("Removed pending event for %s due to "
+                          "lifecycle event", event.uuid)
+
+            if event.transition == virtevent.EVENT_LIFECYCLE_STOPPED:
+                # Delay STOPPED event, as they may be followed by a STARTED
+                # event in case the instance is rebooting, when runned with Xen
+                id_ = greenthread.spawn_after(self._lifecycle_delay,
+                                              self.emit_event, event)
+                self._events_delayed[event.uuid] = id_
+                # add callback to cleanup self._events_delayed dict after
+                # event was called
+                id_.link(event_cleanup, event)
+            else:
+                self.emit_event(event)
+        else:
+            self.emit_event(event)
 
     def _init_events_pipe(self):
         """Create a self-pipe for the native thread to synchronize on.
@@ -1697,7 +1739,7 @@ class LibvirtDriver(driver.ComputeDriver):
             if state == power_state.RUNNING or state == power_state.PAUSED:
                 self._detach_pci_devices(virt_dom,
                     pci_manager.get_instance_pci_devs(instance))
-                self._detach_sriov_ports(instance, virt_dom)
+                self._detach_sriov_ports(context, instance, virt_dom)
                 virt_dom.managedSave(0)
 
         snapshot_backend = self.image_backend.snapshot(instance,
@@ -2486,12 +2528,12 @@ class LibvirtDriver(driver.ComputeDriver):
         # and available before we attempt to start the instance.
         self._hard_reboot(context, instance, network_info, block_device_info)
 
-    def suspend(self, instance):
+    def suspend(self, context, instance):
         """Suspend the specified instance."""
         dom = self._lookup_by_name(instance['name'])
         self._detach_pci_devices(dom,
             pci_manager.get_instance_pci_devs(instance))
-        self._detach_sriov_ports(instance, dom)
+        self._detach_sriov_ports(context, instance, dom)
         dom.managedSave(0)
 
     def resume(self, context, instance, network_info, block_device_info=None):
@@ -3215,12 +3257,11 @@ class LibvirtDriver(driver.ComputeDriver):
                           {'port': vif, 'dom': dom.ID()})
                     dom.attachDevice(cfg.to_xml())
 
-    def _detach_sriov_ports(self, instance, dom):
+    def _detach_sriov_ports(self, context, instance, dom):
         network_info = instance.info_cache.network_info
         if network_info is None:
             return
 
-        context = nova_context.get_admin_context()
         if self._has_sriov_port(network_info):
             # for libvirt version < 1.1.1, this is race condition
             # so forbid detach if it's an older version
@@ -5049,7 +5090,8 @@ class LibvirtDriver(driver.ComputeDriver):
                     dest_check_data['filename'])})
 
         dest_check_data.update({'is_shared_block_storage':
-                self._is_shared_block_storage(instance, dest_check_data)})
+                self._is_shared_block_storage(instance, dest_check_data,
+                                              block_device_info)})
 
         if dest_check_data['block_migration']:
             if (dest_check_data['is_shared_block_storage'] or
@@ -5075,9 +5117,16 @@ class LibvirtDriver(driver.ComputeDriver):
                                                         relative=True)
         dest_check_data['instance_relative_path'] = instance_path
 
+        # NOTE(danms): Emulate this old flag in case we're talking to
+        # an older client (<= Juno). We can remove this when we bump the
+        # compute RPC API to 4.0.
+        dest_check_data['is_shared_storage'] = (
+            dest_check_data['is_shared_instance_path'])
+
         return dest_check_data
 
-    def _is_shared_block_storage(self, instance, dest_check_data):
+    def _is_shared_block_storage(self, instance, dest_check_data,
+                                 block_device_info=None):
         """Check if all block storage of an instance can be shared
         between source and destination of a live migration.
 
@@ -5091,6 +5140,7 @@ class LibvirtDriver(driver.ComputeDriver):
         """
         if (CONF.libvirt.images_type == dest_check_data.get('image_type') and
                 self.image_backend.backend().is_shared_block_storage()):
+            # NOTE(dgenin): currently true only for RBD image backend
             return True
 
         if (dest_check_data.get('is_shared_instance_path') and
@@ -5101,7 +5151,8 @@ class LibvirtDriver(driver.ComputeDriver):
 
         if (dest_check_data.get('is_volume_backed') and
                 not bool(jsonutils.loads(
-                    self.get_instance_disk_info(instance['name'])))):
+                    self.get_instance_disk_info(instance['name'],
+                                                block_device_info)))):
             # pylint: disable E1120
             return True
 
@@ -5429,20 +5480,8 @@ class LibvirtDriver(driver.ComputeDriver):
                           instance=instance)
                 recover_method(context, instance, dest, block_migration)
 
-        # Waiting for completion of live_migration.
-        timer = loopingcall.FixedIntervalLoopingCall(f=None)
-
-        def wait_for_live_migration():
-            """waiting for live migration completion."""
-            try:
-                self.get_info(instance)['state']
-            except exception.InstanceNotFound:
-                timer.stop()
-                post_method(context, instance, dest, block_migration,
-                            migrate_data)
-
-        timer.f = wait_for_live_migration
-        timer.start(interval=0.5).wait()
+        post_method(context, instance, dest, block_migration,
+                    migrate_data)
 
     def _fetch_instance_kernel_ramdisk(self, context, instance):
         """Download kernel and ramdisk for instance in instance directory."""
@@ -5487,11 +5526,13 @@ class LibvirtDriver(driver.ComputeDriver):
             instance_relative_path = migrate_data.get('instance_relative_path')
 
         if not (is_shared_instance_path and is_shared_block_storage):
-            # NOTE(mikal): live migration of instances using config drive is
-            # not supported because of a bug in libvirt (read only devices
-            # are not copied by libvirt). See bug/1246201
-            if configdrive.required_by(instance):
-                raise exception.NoLiveMigrationForConfigDriveInLibVirt()
+            # NOTE(dims): Using config drive with iso format does not work
+            # because of a bug in libvirt with read only devices. However
+            # one can use vfat as config_drive_format which works fine.
+            # Please see bug/1246201 for details on the libvirt bug.
+            if CONF.config_drive_format != 'vfat':
+                if configdrive.required_by(instance):
+                    raise exception.NoLiveMigrationForConfigDriveInLibVirt()
 
         if not is_shared_instance_path:
             # NOTE(mikal): this doesn't use libvirt_utils.get_instance_path
@@ -6091,7 +6132,8 @@ class LibvirtDriver(driver.ComputeDriver):
         xml = self._get_guest_xml(context, instance, network_info, disk_info,
                                   block_device_info=block_device_info)
         self._create_domain_and_network(context, xml, instance, network_info,
-                                        block_device_info, power_on)
+                                        block_device_info, power_on,
+                                        vifs_already_plugged=True)
 
         if power_on:
             timer = loopingcall.FixedIntervalLoopingCall(

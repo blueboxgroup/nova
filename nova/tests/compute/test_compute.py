@@ -573,7 +573,7 @@ class ComputeVolumeTestCase(BaseTestCase):
             })]
             prepped_bdm = self.compute._prep_block_device(
                     self.context, self.instance, block_device_mapping)
-            mock_save.assert_called_once_with(self.context)
+            self.assertEqual(2, mock_save.call_count)
             volume_driver_bdm = prepped_bdm['block_device_mapping'][0]
             self.assertEqual(volume_driver_bdm['connection_info']['serial'],
                              self.volume_id)
@@ -4241,6 +4241,8 @@ class ComputeTestCase(BaseTestCase):
             self.context, objects.Instance(), instance,
             expected_attrs=instance_obj.INSTANCE_DEFAULT_FIELDS)
         for operation in actions:
+            if 'revert_resize' in operation:
+                migration.source_compute = 'fake-mini'
             if operation[0] in want_objects:
                 self._test_state_revert(inst_obj, *operation)
             else:
@@ -6173,7 +6175,7 @@ class ComputeTestCase(BaseTestCase):
                                                     fake_inst_obj)
         self.assertEqual(fake_nw_info, result)
 
-    def test_heal_instance_info_cache(self):
+    def _heal_instance_info_cache(self, _get_instance_nw_info_raise=False):
         # Update on every call for the test
         self.flags(heal_instance_info_cache_interval=-1)
         ctxt = context.get_admin_context()
@@ -6214,6 +6216,8 @@ class ComputeTestCase(BaseTestCase):
             self.assertEqual(call_info['expected_instance']['uuid'],
                              instance['uuid'])
             call_info['get_nw_info'] += 1
+            if _get_instance_nw_info_raise:
+                raise exception.InstanceNotFound(instance_id=instance['uuid'])
 
         self.stubs.Set(db, 'instance_get_all_by_host',
                 fake_instance_get_all_by_host)
@@ -6266,6 +6270,12 @@ class ComputeTestCase(BaseTestCase):
         self.assertEqual(4, call_info['get_by_uuid'])
         # Stays the same because we didn't find anything to process
         self.assertEqual(3, call_info['get_nw_info'])
+
+    def test_heal_instance_info_cache(self):
+        self._heal_instance_info_cache()
+
+    def test_heal_instance_info_cache_with_exception(self):
+        self._heal_instance_info_cache(_get_instance_nw_info_raise=True)
 
     @mock.patch('nova.objects.InstanceList.get_by_filters')
     @mock.patch('nova.compute.api.API.unrescue')
@@ -6589,7 +6599,7 @@ class ComputeTestCase(BaseTestCase):
                 evacuated_instance).AndReturn({'filename': 'tmpfilename'})
         self.compute.compute_rpcapi.check_instance_shared_storage(fake_context,
                 evacuated_instance,
-                {'filename': 'tmpfilename'}).AndReturn(False)
+                {'filename': 'tmpfilename'}, host=None).AndReturn(False)
         self.compute.driver.check_instance_shared_storage_cleanup(fake_context,
                 {'filename': 'tmpfilename'})
         self.compute.driver.destroy(fake_context, evacuated_instance,

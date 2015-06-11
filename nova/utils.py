@@ -81,11 +81,12 @@ utils_opts = [
 """ This group is for very specific reasons.
 
 If you're:
-- Working around an issue in a system tool (e.g. libvirt or qemu) where the fix
-  is in flight/discussed in that community.
-- The tool can be/is fixed in some distributions and rather than patch the code
-  those distributions can trivially set a config option to get the "correct"
-  behavior.
+ - Working around an issue in a system tool (e.g. libvirt or qemu) where the
+   fix is in flight/discussed in that community.
+ - The tool can be/is fixed in some distributions and rather than patch the
+   code those distributions can trivially set a config option to get the
+   "correct" behavior.
+
 This is a good place for your workaround.
 
 Please use with care!
@@ -99,6 +100,12 @@ workarounds_opts = [
                      'mechanism to disable livesnapshot while this is '
                      'resolved.  See '
                      'https://bugs.launchpad.net/nova/+bug/1334398'),
+    cfg.BoolOpt('destroy_after_evacuate',
+                default=True,
+                help='Whether to destroy instances on startup when we suspect '
+                     'they have previously been evacuated. This can result in '
+                      'data loss if undesired. See '
+                      'https://launchpad.net/bugs/1419785'),
     ]
 CONF = cfg.CONF
 CONF.register_opts(monkey_patch_opts)
